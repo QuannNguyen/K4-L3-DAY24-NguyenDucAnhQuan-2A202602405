@@ -37,12 +37,64 @@ rồi gọi verify() phải trả về False.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
+
+_GENESIS_HASH = "0" * 64
+_REQUIRED_FIELDS = {
+    "ts", "agent_id", "run_id", "tool", "args_hash",
+    "classification", "decision", "reason",
+}
+
+
+def _digest(entry: dict) -> str:
+    payload = {key: value for key, value in entry.items() if key != "hash"}
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
 def append(entry: dict, path: Path) -> dict:
-    raise NotImplementedError("BƯỚC 3d: implement ledger append")
+    missing = _REQUIRED_FIELDS.difference(entry)
+    if missing:
+        raise ValueError(f"ledger entry missing required fields: {', '.join(sorted(missing))}")
+    previous_hash = _GENESIS_HASH
+    if path.exists() and path.stat().st_size:
+        with path.open("r", encoding="utf-8") as ledger_file:
+            for line in ledger_file:
+                if line.strip():
+                    previous_hash = json.loads(line)["hash"]
+
+    recorded = dict(entry)
+    recorded["prev_hash"] = previous_hash
+    recorded["hash"] = _digest(recorded)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as ledger_file:
+        ledger_file.write(json.dumps(recorded, ensure_ascii=False, sort_keys=True) + "\n")
+    return recorded
 
 
 def verify(path: Path) -> bool:
-    raise NotImplementedError("BƯỚC 3d: implement ledger verify")
+    if not path.exists():
+        return False
+
+    previous_hash = _GENESIS_HASH
+    try:
+        with path.open("r", encoding="utf-8") as ledger_file:
+            for line in ledger_file:
+                if not line.strip():
+                    return False
+                entry = json.loads(line)
+                if not isinstance(entry, dict):
+                    return False
+                if not isinstance(entry.get("reason"), str) or not entry["reason"].strip():
+                    return False
+                if entry.get("prev_hash") != previous_hash:
+                    return False
+                stored_hash = entry.get("hash")
+                if not isinstance(stored_hash, str) or stored_hash != _digest(entry):
+                    return False
+                previous_hash = stored_hash
+    except (OSError, UnicodeError, json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return False
+    return True

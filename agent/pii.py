@@ -30,10 +30,49 @@ set ở tests/vn_pii_testset.jsonl):
 """
 from __future__ import annotations
 
+import re
+
+_EMAIL = re.compile(r"(?<![\w.+-])[\w.+-]+@[\w-]+(?:\.[\w-]+)+(?![\w-])", re.IGNORECASE)
+_CCCD = re.compile(r"(?<!\d)\d{12}(?!\d)")
+_BANK_LABEL = re.compile(
+    r"(?i)(?:\bSTK\b|số\s*tài\s*khoản|tài\s*khoản)\s*[:#-]?\s*"
+    r"((?:\d[\s-]?){7,15}\d)(?!\d)"
+)
+_PHONE_LABEL = re.compile(
+    r"(?i)(?:\bSĐT\b|số\s*điện\s*thoại|điện\s*thoại)\s*[:#-]?\s*"
+    r"(0(?:[\s.-]?\d){9,10})(?!\d)"
+)
+_PHONE = re.compile(r"(?<!\d)0(?:[\s.-]?\d){9,10}(?!\d)")
+
 
 def detect(text: str) -> list[dict]:
-    raise NotImplementedError("BƯỚC 3a: implement PII detection")
+    candidates: list[dict] = []
+    claimed: list[tuple[int, int]] = []
+
+    def add(kind: str, start: int, end: int) -> None:
+        if any(start < occupied_end and occupied_start < end
+               for occupied_start, occupied_end in claimed):
+            return
+        candidates.append({"type": kind, "start": start, "end": end})
+        claimed.append((start, end))
+
+    for match in _BANK_LABEL.finditer(text):
+        add("VN_BANK_ACCOUNT", *match.span(1))
+    for match in _CCCD.finditer(text):
+        add("VN_CCCD", *match.span())
+    for match in _PHONE_LABEL.finditer(text):
+        add("VN_PHONE", *match.span(1))
+    for match in _PHONE.finditer(text):
+        add("VN_PHONE", *match.span())
+    for match in _EMAIL.finditer(text):
+        add("EMAIL", *match.span())
+
+    return sorted(candidates, key=lambda entity: (entity["start"], entity["end"]))
 
 
 def redact(text: str) -> str:
-    raise NotImplementedError("BƯỚC 3a: implement PII redaction")
+    redacted = text
+    for entity in reversed(detect(text)):
+        replacement = f"[REDACTED_{entity['type']}]"
+        redacted = redacted[:entity["start"]] + replacement + redacted[entity["end"]:]
+    return redacted

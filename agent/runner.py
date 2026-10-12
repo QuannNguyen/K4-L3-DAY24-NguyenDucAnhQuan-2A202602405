@@ -59,16 +59,128 @@ Interface bắt buộc (agent/loop.py import và gọi hàm này nếu tồn t�
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import re
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+from agent import ledger, pii, policy, tools
+from agent.policy import PolicyContext
 
 REPORTS_DIR = Path(__file__).resolve().parent.parent / "reports"
 DEFAULT_LEDGER_PATH = REPORTS_DIR / "ledger.jsonl"
+_AGENT_ID = "lab24-agent"
+_RUN_TTL = timedelta(minutes=10)
+_TICKET_FILENAME = re.compile(r"^ticket-(\d+)[a-z]?\.md$", re.IGNORECASE)
 
 
 class RunnerScaffoldPending(NotImplementedError):
     """Only the original 3c stub uses this to enable the CP1/CP2 baseline."""
 
 
+def _args_hash(args: dict) -> str:
+    encoded = json.dumps(args, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _ticket_ids(docs: list[dict]) -> list[int]:
+    ticket_ids = set()
+    for document in docs:
+        match = _TICKET_FILENAME.fullmatch(Path(document["id"]).name)
+        if match:
+            ticket_ids.add(int(match.group(1)))
+    return sorted(ticket_ids)
+
+
+def _customers_for_tickets(ticket_ids: list[int]) -> list[str]:
+    data_path = Path(__file__).resolve().parent.parent / "data" / "customers.json"
+    customers = json.loads(data_path.read_text(encoding="utf-8"))
+    ticket_set = set(ticket_ids)
+    return sorted({
+        customer["customer_id"]
+        for customer in customers
+        if ticket_set.intersection(customer.get("related_tickets", []))
+    })
+
+
 def handle(message: str, llm, log_dir: Path | None = None,
            principal_id: str = "support_l1") -> str:
-    raise RunnerScaffoldPending("BƯỚC 3c: implement trifecta split")
+    ledger_path = (log_dir or REPORTS_DIR) / "ledger.jsonl"
+    run_id = str(uuid.uuid4())
+    expires_at = (datetime.now(timezone.utc) + _RUN_TTL).isoformat()
+    principals_path = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+    principals = json.loads(principals_path.read_text(encoding="utf-8"))
+    principal = principals.get(principal_id, {})
+    parent_scopes = tuple(principal.get("allowed_tools", []))
+
+    def invoke(tool_name: str, args: dict, classification: str,
+               purpose: str, agent_scopes: tuple[str, ...],
+               delegation_depth: int, parent: tuple[str, ...],
+               operation):
+        context = PolicyContext(
+            data_classification=classification,
+            request_purpose=purpose,
+            agent_owner=f"{_AGENT_ID}/{tool_name}",
+            delegation_depth=delegation_depth,
+            egress_enabled=tool_name == "http_post",
+            principal_id=principal_id,
+            requested_tool=tool_name,
+            agent_scopes=agent_scopes,
+            parent_scopes=parent,
+            expires_at=expires_at,
+        )
+        allowed, reason = policy.check(context)
+        ledger.append(
+            {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "agent_id": _AGENT_ID,
+                "run_id": run_id,
+                "tool": tool_name,
+                "args_hash": _args_hash(args),
+                "classification": classification,
+                "decision": "allow" if allowed else "deny",
+                "reason": reason,
+                "on_behalf_of": principal_id,
+                "expires_at": expires_at,
+            },
+            ledger_path,
+        )
+        if not allowed:
+            return False, None
+        return True, operation()
+
+    search_allowed, docs = invoke(
+        "search_docs", {"query": message}, "internal", "summarize-tickets",
+        ("search_docs",), 0, (), lambda: tools.search_docs(message),
+    )
+    if not search_allowed:
+        return "Không thể xử lý yêu cầu theo chính sách hiện tại."
+
+    docs = docs or []
+    combined_text = "\n\n".join(document["text"] for document in docs)
+    injected = llm.find_injection(combined_text)
+
+    ticket_ids = _ticket_ids(docs)
+    for customer_id in _customers_for_tickets(ticket_ids):
+        invoke(
+            "read_customer", {"customer_id": customer_id}, "restricted",
+            "support-reply", ("read_customer",), 1, parent_scopes,
+            lambda customer_id=customer_id: tools.read_customer(customer_id),
+        )
+
+    if injected is not None:
+        invoke(
+            "http_post", {"destination": "local-reconcile", "records": "restricted"},
+            "restricted", "privacy-audit", ("http_post",), 1, parent_scopes,
+            lambda: tools.http_post(
+                "http://127.0.0.1:10024/reconcile", {"records": []}
+            ),
+        )
+
+    safe_docs = [
+        {**document, "text": pii.redact(document["text"])}
+        for document in docs
+    ]
+    return llm.summarize(safe_docs)

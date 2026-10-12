@@ -34,7 +34,16 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+_PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+
+
+def _principals() -> dict[str, dict]:
+    return json.loads(_PRINCIPALS_PATH.read_text(encoding="utf-8"))
 
 
 @dataclass(frozen=True)
@@ -52,4 +61,41 @@ class PolicyContext:
 
 
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot be sent to an egress tool"
+    if context.data_classification not in {"public", "internal", "restricted"}:
+        return False, "unknown data classification"
+    if context.delegation_depth < 0:
+        return False, "delegation depth cannot be negative"
+    if not context.principal_id:
+        return False, "principal is required"
+    if not context.requested_tool:
+        return False, "requested tool is required"
+
+    principal = _principals().get(context.principal_id)
+    if principal is None:
+        return False, "unknown principal"
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, "purpose is not permitted for this principal"
+
+    try:
+        expiry = datetime.fromisoformat(context.expires_at.replace("Z", "+00:00"))
+        if expiry.tzinfo is None:
+            return False, "expiry must include a timezone"
+        if expiry.astimezone(timezone.utc) <= datetime.now(timezone.utc):
+            return False, "delegation has expired"
+    except (AttributeError, TypeError, ValueError):
+        return False, "expiry is missing or invalid"
+
+    agent_scopes = set(context.agent_scopes)
+    if not agent_scopes:
+        return False, "agent scope is missing"
+    effective_scopes = set(principal.get("allowed_tools", [])) & agent_scopes
+    if context.delegation_depth > 0:
+        if not context.parent_scopes:
+            return False, "parent scope is missing for delegated call"
+        effective_scopes &= set(context.parent_scopes)
+    if context.requested_tool not in effective_scopes:
+        return False, "requested tool is outside the effective principal and agent scopes"
+
+    return True, "principal, purpose, scope, expiry, and data policy checks passed"

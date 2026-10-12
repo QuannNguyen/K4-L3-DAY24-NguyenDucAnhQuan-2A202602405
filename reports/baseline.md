@@ -1,5 +1,5 @@
-# Baseline — điền trong checkpoint 1
+# Baseline — trước khi containment
 
-1. Agent có identity mỗi run chưa? Dẫn file/hàm:
-2. Ai cho phép `http_post`? Dẫn file/hàm:
-3. Nếu gửi sai PII ra sink, bằng chứng ở đâu? Dẫn file/hàm:
+1. **Chưa.** `agent.loop._naive_loop()` không tạo principal/run identity hoặc scope cho tool call.
+2. **Không có policy gate.** `_naive_loop()` gọi `tools.http_post()` trực tiếp khi mock tìm thấy chỉ thị; `agent.tools.http_post()` chỉ giới hạn đích localhost để giữ bài lab an toàn, không cấp quyền.
+3. `reports/attack-before.log` ghi POST tới `/reconcile`, gồm duy nhất record synthetic `KH-000999`. Đây là baseline trước containment; không phải dữ liệu khách hàng thật.
